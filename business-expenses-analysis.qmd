@@ -1,0 +1,759 @@
+---
+title: "Business Employee Expenses"
+subtitle: "Analysis & Modeling"
+author: "Paula López Casado"
+date: "September 5, 2024"
+css: expenses.css
+title-block-banner: "#0d1b2a"
+format: 
+  html:
+    message: false
+    warning: false
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    mainfont: 'Helvetica Neue'
+    linkcolor: '#415a77'
+engine: knitr
+---
+
+# Introduction
+
+Managing employee expenses by hand can be a real headache. It eats up valuable time and keeps people in repetitive tasks instead of focusing on what really matters. Using technology that automates the tedious stuff can help to make the whole process smoother and more efficient. This isn't just about reducing paperwork; it's about helping teams shift their attention to the bigger financial picture and empowering them to make better decisions for the company.
+
+# Objective
+
+In this project we **analyse business spending trends** based on a dummy business expenses dataset and we propose a **Machine Learning predictive model** to determine the expenses that need human attention.
+
+# Key Insights
+
+:::callout-note
+## Key insights
+
+- February and December are the months with the lowest spending, ~€15K, being June the month with the higher spending that exceed €30K.
+- There is one `Events` expense from team 19445 that exceeds of €9.5K.
+- Team 19445 dominates the company’s expense, accounting for 56% of the total expense, equivalent to €167K. Following closely, Team 90684 represents 8% of the expense, and Team 8349 with €15K accounts for 5%. The remaining teams collectively contribute 28% of the total expense.
+- Great Britain (GB) is the country where the teams expense more in total, 74%. Portugal (PT) follows the ranking with 8% of the amount expended, followed by Denmark (4%) and Spain (3%).
+- `Lunch` in GB is the most common expense category with a 46% of the expenses, followed by `Meal & Drinks` and `Travel` in GB as well, 10% and 7% respectively.
+- There are some unusual expenses (< 1%) such as 30 travels to Norway with a total spend of €7K, as well as events in Denmark and Spain of similar values.
+- The average waiting time is 176 days and the days since creation of the expense that has been waiting the most is 360 days, practically one year waiting for approval. 
+
+:::
+
+# Part 1) Data Exploration
+
+```{python libraries}
+# Import libraries
+from mizani.formatters import label_date, label_currency  # Label currencies in ggplot
+import pandas as pd  # Data manipulation
+import numpy as np
+from forex_python.converter import CurrencyRates # Currency converter
+import yahoo_fin.stock_info as si  # Import Yahoo Stock historical data
+from datetime import date, datetime, timedelta  # Handle date and time operations
+
+# Model
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder
+
+# Plot necessary functions from plotnine to plot
+from plotnine import (ggplot, aes, theme_minimal, element_blank, element_line, element_text, theme, theme_set, options, geom_line, geom_point, geom_text, geom_col, geom_boxplot, geom_tile, geom_hline, scale_fill_gradient, scale_x_date, scale_x_discrete, scale_y_continuous, labs, scale_fill_manual, scale_color_manual, facet_wrap)
+```
+
+```{python dataviz set up}
+# Define a font
+main_font = "Helvetica Neue"
+
+# Figure Size
+options.figure_size = (9, 6)
+options.dpi = 200
+
+# Define ggplot theme
+def expenses_ggplot_theme():
+    return (theme_minimal() +
+            theme(panel_grid_minor=element_blank(),
+                  panel_grid_major_x=element_blank(),
+                  panel_grid_major=element_line(linewidth=0.25),
+                  panel_background=element_blank(),
+                  axis_title=element_text(family=main_font),
+                  axis_text=element_text(family=main_font),
+                  axis_ticks_x=element_line(),
+                  legend_position='bottom',
+                  strip_text=element_text(family=main_font, face="bold", hjust=0.5, size=12),
+                  plot_title=element_text(family=main_font, face="bold", hjust=0.5, size=18),
+                  plot_subtitle=element_text(family=main_font, face="italic", hjust=0.5))
+            )
+
+# Set plotnine theme
+theme_set(expenses_ggplot_theme())
+
+# Define the colors in RGB format
+expenses_colors = ["#415a77","#e9c46a","#2a9d8f","#e76f51"]
+```
+
+## Load Data
+
+```{python load-data, output}
+# Load the dataset
+df = pd.read_csv("expenses.csv") 
+
+# Display the first few rows of the dataset
+df.head()
+```
+
+## Feature Engineering
+
+### Check missing values
+
+```{python missing-values}
+# Check for missing values
+df.isnull().sum()
+```
+
+There are no missing values, then no action is required.
+
+### Transform date column
+
+```{python covert-dates}
+# Convert 'expense_created_at' column to datetime with UTC timezone, coercing errors to NaT
+df['expense_created_at_as_dt'] = pd.to_datetime(df['expense_created_at'], utc=True, errors='coerce')
+
+# Select rows with NaN values in any column
+df_aux = df[df.isnull().any(axis=1)]
+
+# Convert 'expense_created_at' column of the selected rows to datetime with UTC timezone, coercing errors to NaT
+df_aux_datetime = pd.to_datetime(df_aux['expense_created_at'], utc=True, errors='coerce')
+
+# Combine 'expense_created_at_as_dt' column of the original DataFrame with 'expense_created_at_as_dt' column of the selected rows, filling NaN values in the original DataFrame with corresponding values from the selected rows
+df['expense_created_at_as_dt'] = df_aux_datetime.combine_first(df['expense_created_at_as_dt'])
+
+# Add 'month' column formatted as "Month Year"
+df['month'] = df['expense_created_at_as_dt'].dt.to_period('M')
+```
+
+### Convert all currencies to EUR 
+
+There are several amount currencies, so it is required to transform all currencies to EUR to be able to compare different expenses. There are several ways to convert currencies. 
+
+1) Use an API to obtain for each date the expense currency. The library `forex_python` uses https://theforexapi.com, a free API for current and historical foreign exchange rates published by European Central Bank (ECB). This option has two main problems: first, not all currencies in the dataset are available, and second, the time of execution is higher than 20 mins, so we discarded this solution.
+
+2) Retrieve daily historical currency prices for the year 2023 from Yahoo Finance's forex market data. Then, integrate this exchange rate data with the main dataset by merging the two datasets. Execution time is reduced to seconds.
+
+```{python currency-exchange-option1, eval = F}
+# # Create a CurrencyRates object
+# cr = CurrencyRates()
+# 
+# # Convert each expense amount to Euro (EUR) based on the currency and date of the expense
+# converted_expenses = []
+# for index, row in df.iterrows():
+#     base_currency = row['amount_currency']
+#     expense_amount = row['amount_value']
+#     expense_date = row['expense_created_at_as_dt']
+#     
+#     try:
+#         # Use the convert function to directly convert the expense amount to Euro (EUR)
+#         converted_amount = cr.convert(base_currency, 'EUR', expense_amount, expense_date)
+#         converted_expenses.append(converted_amount)
+#     except Exception as e:
+#         print(f"An error occurred during currency conversion for row {index}: {e}")
+#         converted_expenses.append(None)
+#         
+# # Add a new column for Euro (EUR) expense amounts to the DataFrame
+# df['amount_value_EUR'] = converted_expenses
+```
+
+```{python currency-exchange-option2}
+# List unique currencies
+list_currencies = df['amount_currency'].unique()
+
+# Keep only currencies different to EUR
+list_currencies = [x for x in list_currencies if x != 'EUR']
+
+# Initiate data frame for the exchange rates
+df_exchange_rates = pd.DataFrame()
+
+# Fix first and last dates. Get one day before to ensure to have day one of the year
+start_period = '2022-12-30'
+end_period = '2023-12-31'
+
+# Interval 
+interval = '1d'
+
+# Init exchanges rates USD/EUR in case the currency exchange rate is not available to EUR
+exchange_rates_i_eur = pd.Series([])
+
+# Create a dataframe with all dates of 2023
+all_dates = pd.date_range(start=start_period, end=end_period, freq='D')
+df_all_dates = pd.DataFrame({'day': all_dates})
+
+for currency in list_currencies:
+  
+  print('Currency: ' + currency)
+  
+  try:
+    exchange_rates_i = si.get_data(currency + 'EUR=X', interval=interval, start_date=start_period, end_date=end_period)['adjclose']
+    
+    # If there is no EUR exchange rate available, get the USD exchange rate
+  except Exception:
+      exchange_rates_i_usd = si.get_data(currency + 'USD=X', interval=interval, start_date=start_period, end_date=end_period)['adjclose'] 
+      
+      # If exchange rate USD/EUR has not been obtained yet, get the rates
+      if exchange_rates_i_eur.empty:
+        exchange_rates_i_eur = si.get_data('USDEUR=X', interval=interval, start_date=start_period, end_date=end_period)['adjclose'] 
+      
+      # Calculate the exchange rate in EUR by XXX/USD * USD/EUR, where XXX is the current currency
+      exchange_rates_i = exchange_rates_i_usd * exchange_rates_i_eur
+  
+  # Transform to data frame
+  df_exchange_rates_i = exchange_rates_i.to_frame(name='exchange_rate_EUR')
+  
+  # Move indexes to a column
+  df_exchange_rates_i.reset_index(inplace=True)
+  
+  # Rename the date column to 'day'
+  df_exchange_rates_i.rename(columns={'index': 'day'}, inplace=True)
+
+  # Merge all 2023 dates with exchange rates
+  df_exchange_rates_i = pd.merge(df_all_dates, df_exchange_rates_i, on='day', how='left')
+
+  # Fill missing exchange rates with the last available
+  df_exchange_rates_i['exchange_rate_EUR'] = df_exchange_rates_i['exchange_rate_EUR'].ffill()
+  
+  # Add column with the current currency
+  df_exchange_rates_i['amount_currency'] = currency
+  
+  # Keep only 2023 dates
+  df_exchange_rates_i = df_exchange_rates_i[df_exchange_rates_i['day'].dt.year == 2023]
+  
+  # Concatenate current currency exchange rates with the rest of currency rates
+  df_exchange_rates = pd.concat([df_exchange_rates, df_exchange_rates_i])
+
+# Localize day column in UTC timezone
+df_exchange_rates['day'] = df_exchange_rates['day'].dt.tz_localize('UTC')
+
+# Convert 'day' and 'expense_created_at_as_dt' columns to date format
+df_exchange_rates['day'] = df_exchange_rates['day'].dt.date  
+df['day'] = df['expense_created_at_as_dt'].dt.date  
+
+# Merge DataFrames 'df' and 'df_exchange_rates' based on 'day' and 'amount_currency' columns
+df = pd.merge(df, df_exchange_rates, how='left', on=['day', 'amount_currency'])
+```
+
+We expect `exchange_rate_EUR == NaN` for all EUR currencies.
+
+```{python EUR-exchange-rates}
+# Check if all amount_currency == EUR for all null values in exchange_rate_EUR
+df[df.isna().any(axis=1)]['amount_currency'].unique() == 'EUR'
+
+# Fill NaN values in column 'exchange_rate_EUR' with 1
+df['exchange_rate_EUR'] = df['exchange_rate_EUR'].fillna(1)
+
+# Convert each amount value by the exchange rate
+df['amount_value_EUR'] = df['amount_value'] * df['exchange_rate_EUR']
+
+df[['amount_value','amount_currency','amount_value_EUR']].head()
+```
+
+## Spending over time
+
+Let's analyse how much is spent over time.
+
+```{python monthly-expenses}
+# Total Expenses by month
+total_expense_per_month = df.groupby(['month'])['amount_value_EUR'].sum().reset_index()
+
+(ggplot(total_expense_per_month, aes(x='month', y='amount_value_EUR')) +
+    geom_col(alpha = 0.4) + 
+    scale_x_discrete(labels=label_date("%b %Y")) +
+    scale_y_continuous(labels=label_currency(prefix = "€ ", accuracy=0)) +
+    labs(title='Expenses Over Time', x='Month', y='Amount Value EUR') 
+).show()
+```
+
+There are no major differences in the total amount expended by month. February and December are the months with the lowest spending, ~€15K. In June, spending exceed €30K so we can deep dive on the daily trend.
+
+```{python}
+# Calculate daily expenses in June 2023
+june_daily_expenses = df[df['month'] == '2023-06-01'].groupby('day')['amount_value_EUR'].sum().reset_index()
+
+(ggplot(june_daily_expenses, aes(x='day', y='amount_value_EUR/1000', group=1)) +
+    geom_line() +
+    geom_point() +
+    labs(title='June Daily Expenses', x='Date', y='Expense') +
+    theme(axis_text_x = element_text(angle=45, hjust=1), legend_position='top') +
+    scale_y_continuous(labels=label_currency(prefix = "€ ", suffix="K", accuracy=0))
+).show()
+```
+
+During June 2023 expenses are lower than €2K, except for June 20th, when expenses are almost raising €10K. We filter the initial data to find the expense/s associated:
+
+```{python}
+df[(df['month'] == '2023-06-01') & (df['amount_value_EUR'] > 9000)]
+```
+
+The event corresponds to an expense of the team 19445 of €9501 of the category `Events`.
+
+Finally, we suppose teams have different behaviour in terms of spending over time. Some of them probably have recurrent expenses, and others, more variability in the way they spend. Let´s explore in a visualization if the hypothesis is true.
+
+```{python}
+# Line and point plot for the expenses over time for the top 6 teams
+(ggplot(df[df['team_id'].isin([19445, 90684, 8349, 14343, 54795, 7452])], aes(x='day', y='amount_value_EUR', group = 'team_id')) +
+    geom_point(alpha = 0.35) + geom_line(alpha = 0.5) + facet_wrap('team_id', scales = "free") +
+    scale_x_date() +
+    scale_y_continuous(labels=label_currency(prefix = "€ ", accuracy=0)) +
+    labs(title='Expenses Over Time', x='Date', y='Amount Value EUR') 
+).show()
+```
+
+As we can see in the plot, there are expenses recurrent along time. For example, team 7452 has several expenses with similar value across different months.
+
+## What are the most common categories?
+
+Let´s explore which are the most common categories and the median and total spending by category.
+
+```{python category-summary}
+# Group by category and calculate median and total spend
+category_summary = df.groupby('category')['amount_value_EUR'].agg(['count', 'median', 'sum']).sort_values(by='sum', ascending=False)
+
+# Calculate total spend
+total_spend = category_summary['sum'].sum()
+
+# Calculate percentage spend per category
+category_summary['percentage_spend'] = (category_summary['sum'] / total_spend) * 100
+
+category_summary
+```
+
+`Lunch` is the category most common with more than 53% (2790) expenses followed by Meal & Drinks, 28%. Nevertheless, `Travel` is the category where the company expense the most, as it could be expected. Travel amount is higher than €110K (37%) followed by `Events`, €93K (31%). `Meal and Drinks` is the category with the lower spending, just €27K (9%).
+
+### Lunch 
+
+After reviewing the main statistics, it could be interesting to see the distribution of the expenses by month.
+
+```{python}
+# Add 'amount_bucket' column rounded to the nearest 10
+df['amount_bucket'] = (df['amount_value_EUR'] / 10).round(0)
+
+# Filter by lunch category
+df_lunch = df.loc[df['category'] == "Lunch"]
+
+# Count occurrences of each combination of 'month', and 'amount_bucket'
+df_lunch_count = df_lunch.groupby(['month', 'amount_bucket']).size().reset_index(name='n')
+
+# Plot the heatmap
+(ggplot(df_lunch_count, aes(x='month', y='amount_bucket * 10', fill='n')) +
+ geom_tile(color="white") +
+ scale_fill_gradient(low="#e0e1dd", high="#415a77") +
+ theme(panel_grid_minor=element_blank(), panel_grid_major=element_blank()) +
+ scale_x_discrete(labels=label_date("%b %Y")) +
+ scale_y_continuous(breaks=range(0, 301, 10), labels=label_currency(prefix = "€ ", accuracy=0)) +
+ labs(x="Month", y="Amount Bucket", fill="Count", title="Lunch - Expense Heatmap")).show()
+```
+
+Most common `Lunch` expenses are between €10-€20. In general, `Lunch` expenses are lower than €100, but in some cases the amount increase over €200 in the months of June, November and December.
+
+### Meals & Drinks
+
+```{python meals-heatmap}
+# Filter by lunch category
+df_meals = df.loc[df['category'] == "Meals & Drinks"]
+
+# Count occurrences of each combination of 'month', and 'amount_bucket'
+df_meals_count = df_meals.groupby(['month', 'amount_bucket']).size().reset_index(name='n')
+
+# Monthly boxplot of the meals and drinks expenses (EUR)
+(ggplot(df_meals, aes(x='month', y='amount_value_EUR')) +
+  geom_boxplot() +
+  scale_x_discrete(labels=label_date("%b %Y")) +
+  scale_y_continuous(breaks = range(0, 801, 50), labels=label_currency(prefix = "€ ", accuracy=0)) +
+  labs(x="Month", y="Amount EUR", fill="Count", title="Meals & Drinks - Expense")).show()
+```
+
+Meal expenses are normally lower than €50. Nevertheless, there are few outliers with remarkable high value. One of them close to €750 and the other two around €300-€350.
+
+### Travel 
+
+```{python travel-heatmap}
+# Filter category Travel
+df_travel = df.loc[df['category'] == "Travel"]
+
+# Count occurrences of each combination of 'month' and 'amount_bucket'
+df_travel_count = df_travel.groupby(['month', 'amount_bucket']).size().reset_index(name='n')
+
+# Plot the heatmap
+(ggplot(df_travel_count, aes(x='month', y='amount_bucket * 10', fill='n')) +
+   geom_tile(color="white") +
+   scale_x_discrete(labels=label_date("%b %Y")) +
+   scale_y_continuous(labels=label_currency(prefix="€ ", accuracy=0)) +
+   scale_fill_gradient(low="#e0e1dd", high="#415a77") +
+   theme(panel_grid_minor=element_blank(), panel_grid_major=element_blank()) +
+   labs(x="Month", y="Amount Bucket", fill="Count", title="Travel - Expense Heatmap")).show()
+```
+
+There are no specific patterns for `Travel` category. In general, expenses are higher than in other categories like `Lunch` or `Meal & Drinks` up to €838. Most common expenses are between €100-€400 spread throughout the year.
+
+### Events
+
+:::callout.note
+`Events` category will be analysed in the next section about team spending.
+:::
+
+## How spendings are made: online or in store?
+
+```{python purchase-type}
+# Count by purchase type
+purchase_type_counts = df['purchase_type'].value_counts()
+
+# Percentage by purchase type
+purchase_type_percentage = (purchase_type_counts / len(df)) * 100
+purchase_type_percentage
+```
+
+The most common way to purchase is `IN STORE` with a 79% of the purchases. Only 21% of the expenses are arranged `ONLINE`.
+
+## How much does each team spend?
+
+```{python}
+# Summarize the data
+total_expense = df.groupby('team_id')['amount_value_EUR'].sum().reset_index()
+
+# Transform team_id to categorical 
+total_expense['team_id'] = pd.Categorical(total_expense['team_id'])
+
+# Plot the total expense by team
+(ggplot(total_expense, aes(x = 'reorder(team_id, -amount_value_EUR)', y = 'amount_value_EUR')) + 
+  geom_col(color = expenses_colors[0], fill = expenses_colors[0]) + 
+  theme(axis_text_x = element_text(angle=45)) +
+  labs(x="Team", y="Amount Value EUR", title="Total Team Expenses")).show()
+```
+
+Team 19445 stands out with significantly higher spending compared to the other teams.
+
+```{python}
+# Calculate the percentage
+total_expense['percentage'] = (total_expense['amount_value_EUR'] / total_expense['amount_value_EUR'].sum()) * 100
+
+# Sort the dataframe by total expense in descending order
+total_expense = total_expense.sort_values(by='amount_value_EUR', ascending=False)
+
+# Reset index
+total_expense.reset_index(drop=True, inplace=True)
+
+# Display the table
+total_expense.head()
+```
+
+Among all teams, Team 19445 dominates the company's expense, accounting for 56% of the total expense, equivalent to €167K. Following closely, Team 90684 represents 8% of the expense, and Team 8349 with €15K accounts for 5%. The remaining teams collectively contribute 28% of the total expense.
+
+### How much teams spends on events and travels?
+
+```{python}
+# Filter rows where category is "Events"
+df_events = df[df['category'] == 'Events']
+
+# Group by team_id and sum amount_value_EUR
+total_by_team = df_events.groupby('team_id')['amount_value_EUR'].sum().reset_index()
+
+# Calculate percentage of total for each team
+total_by_team['pct'] = (total_by_team['amount_value_EUR'] / total_by_team['amount_value_EUR'].sum())*100
+
+# Sort by total in descending order
+total_by_team.sort_values(by='amount_value_EUR', ascending=False).head()
+```
+
+The team who has the higher expense in `Events` is 19445. 69% of the total expense is accounted to this team.
+
+```{python}
+# Filter rows where category is "Travel"
+df_travel = df[df['category'] == 'Travel']
+
+# Group by team_id and sum amount_value_EUR
+total_by_team = df_travel.groupby('team_id')['amount_value_EUR'].sum().reset_index()
+
+# Calculate percentage of total for each team
+total_by_team['pct'] = (total_by_team['amount_value_EUR'] / total_by_team['amount_value_EUR'].sum())*100
+
+# Sort by total in descending order
+total_by_team.sort_values(by='amount_value_EUR', ascending=False).head()
+```
+
+The team who has the higher expense in `Travel` is 19445, 54% of the total expense and 90684, 11%. Rest of the teams account less than the 5% of the total expense of the period of study, under €5K.
+
+## Where the company spends the most?
+
+Let´s now review the countries more expensive for the company, or better said, where are located most of the expenses and which countries have the higher amount.
+
+```{python}
+# Group by merchant_country and calculate total amount and count
+df_country = df.groupby('merchant_country').agg(total_amount=('amount_value_EUR', 'sum'), n=('amount_value_EUR', 'count'))
+
+# Calculate percentage of total amount and count
+total_amount_sum = df_country['total_amount'].sum()
+count_sum = df_country['n'].sum()
+df_country['pct_amount'] = (df_country['total_amount'] / total_amount_sum)*100
+df_country['pct'] = (df_country['n'] / count_sum)*100
+
+# Arrange the DataFrame by total amount in descending order
+df_country.sort_values(by='pct_amount', ascending=False)
+```
+
+Great Britain (GB) is the country where the teams expense more in total, 74%. Portugal (PT) follows the ranking with 8% of the amount expended, followed by Denmark (4%) and Spain (3%). In terms of number of expenses, similar order of merchant country is followed. Something remarkable is the case of Norway. The country has the 0.5% of the expenses but only 2% of total amount expended, that means probably Norwegian expenses are higher than the mean.
+
+### Merchant Country & Category
+
+```{python}
+# Group by category and merchant_country, calculate total money and count
+df_cat_country = df.groupby(['category','merchant_country']).agg(total_amount=('amount_value_EUR', 'sum'), n=('amount_value_EUR', 'count')).reset_index()
+
+# Calculate percentage of total money and count
+total_amomunt_sum = df_cat_country['total_amount'].sum()
+count_sum = df_cat_country['n'].sum()
+df_cat_country['pct_amount'] = df_cat_country['total_amount'] / total_amomunt_sum
+df_cat_country['pct'] = df_cat_country['n'] / count_sum
+df_cat_country.sort_values(by='total_amount', ascending=False).head()
+```
+
+```{python}
+# Sort values by total amount descending
+df_cat_country = df_cat_country.sort_values(by='total_amount', ascending = False)
+
+# PLot total expenses by country and category
+(ggplot(df_cat_country, aes(x='reorder(merchant_country, -total_amount)', y='total_amount/1000', fill = 'category', color = 'category')) + 
+    geom_col() +
+    scale_color_manual(values=expenses_colors) +
+    scale_fill_manual(values=expenses_colors) +
+    scale_y_continuous(labels=label_currency(prefix="€ ", suffix = "K", accuracy=0)) +
+    facet_wrap('category', scales='free_y') +
+    labs(x="Merchant Country", y="Total Amount", title="Total Amount (EUR) by Country and Category", subtitle="Note: Axis have different scales")).show()
+```
+
+:::callout-warning
+Note y-axis has free scales.
+:::
+
+**Most common**. `Lunch` in GB is the most common expense category with a 46% of the expenses, followed by `Meal & Drinks` and `Travel` in GB as well, 10% and 7% respectively.
+
+**Total Expenses**. GB has 70% of total expenses where 30% (€91K) is for `Travelling`, 20% (€61K) for `Events` and 20% (€58K) for `Lunch.`
+
+**Category Distribution**. In terms of total amount distribution by country & category, GB highlights in all categories compared to the second in the ranking, Portugal or Norway in `Travel` expenses.
+
+Based on the data, the company seems to be situated in GB or at least with a high amount of business in this country due to most of the merchants of the submitted expenses are located there.
+
+## Unsual expenses
+
+```{python}
+# Group by category and merchant_country, calculate total_money and count
+grouped_df = df.groupby(['category','merchant_country']).agg(total_money=('amount_value_EUR', 'sum'), n=('amount_value_EUR', 'count')).reset_index()
+
+# Arrange by total_money in descending order
+sorted_df = grouped_df.sort_values(by='total_money', ascending=False)
+
+# Calculate percentage of total money and count
+total_money_sum = sorted_df['total_money'].sum()
+count_sum = sorted_df['n'].sum()
+sorted_df['pct_money'] = sorted_df['total_money'] / total_money_sum
+sorted_df['pct'] = sorted_df['n'] / count_sum
+
+# Filter rows where pct is less than 0.01
+sorted_df[sorted_df['pct'] < 0.01].head()
+```
+
+There are some other unusual expenses (number of occurrences < 1%) such as 30 travels to Norway with a total spend of €7K, as well as events in Denmark (DK) with a total value of €6K, and Spain (ES) €5K.
+
+## Expenses to review
+
+For the dates extracted from `expense_created_at` we can deduce how long some expenses have been waiting for reviewer. One of the main goals of the exercise is to help to reduce this waiting approval time. Let´s analyse the correlation between days waiting for approval of an expense and the amount value in EUR.
+
+```{python}
+# Calculate the number of days since the expense was created until December 31, 2023
+df['days_since_creation'] = (pd.to_datetime('2023-12-31', utc=True) - df['expense_created_at_as_dt']).dt.days
+```
+
+```{python}
+# Plot expenses waiting for reviewer
+(ggplot(df[df['review_status'] == "WAITING_FOR_REVIEWER"], aes(x='days_since_creation', y='amount_value_EUR/1000', color='category')) +
+  geom_point() +
+  geom_text(data=df[(df['review_status'] == "WAITING_FOR_REVIEWER") & (df['amount_value_EUR'] > 2000)], mapping=aes(x='days_since_creation', y='amount_value_EUR/1000', label='team_id')) +
+  scale_color_manual(values=expenses_colors) +
+    scale_y_continuous(labels=label_currency(prefix="€ ", suffix = "K", accuracy=0)) +
+  labs(title="Expenses Waiting for Reviewer", x="Days Since Creation", y="Amount value EUR")
+).show()
+
+# Plot expenses waiting for reviewer - filtering lower than 2K
+(ggplot(df[(df['review_status'] == "WAITING_FOR_REVIEWER") & (df['amount_value_EUR'] < 2000)], aes(x='days_since_creation', y='amount_value_EUR', color='category')) +
+  geom_point() +
+  scale_color_manual(values=expenses_colors) +
+    scale_y_continuous(labels=label_currency(prefix="€ ", accuracy=0)) +
+  labs(title="Expenses Waiting for Reviewer", x="Days Since Creation", y="Amount value EUR")
+).show()
+```
+
+There are two expenses from team 19445 and 54795 around €4K that highlight from the rest of expenses. The last one has been waiting for review more than 350 days.
+
+Expenses waiting for reviewer are from all categories in a balanced way. The amount value is higher for `Events` and `Travel` categories, compared with `Lunch` and `Meal & Drinks` categories. 
+
+The average waiting time is 176 days and the days since creation of the expense that has been waiting the most is 360 days, practically one year waiting for approval. 
+
+## Conclusions
+
+The exploratory data analysis reveals several important spending patterns that provide a strong foundation for future improvements in the expense management process. Key trends show that spending is concentrated among a few teams and countries, with Team 19445 and Great Britain leading in total expenses. This highlights the importance of focusing resources on these areas for further analysis and optimization. Additionally, the uneven distribution of expenses throughout the year, with spikes in certain months, suggests opportunities for better financial planning and forecasting.
+
+The data also points to some outlier expenses, such as significant event costs and unusual travel expenses, which may warrant closer scrutiny or policy changes. Automating the process will not only streamline routine approvals but also help flag these atypical expenses more efficiently. Moreover, the long average waiting time for expense approvals indicates that the current manual process is causing delays that could impact financial visibility and decision-making.
+
+Overall, the insights gathered from this analysis emphasize the need for a more dynamic and automated expense management system that prioritizes high-cost teams and categories while reducing delays and enhancing the company’s ability to manage finances proactively. This will allow finance teams to focus on strategic decision-making and improve overall efficiency.
+
+# Part 2) Business Spending Scoring System
+
+We aim to detect those expenses that needs human attention. For these task, we propose a **ranking model** to estimate the *priority to review* given the option of automate the approval process for those cases where indicator is lower than a specific threshold.
+
+**Features Selected**
+
+In base on the data analysed previously, we would include in order of importance. First, the `amount value` of the expense in EUR and the `number of days` since the expense was submitted. Secondly, the `team` as there are some teams that incur the same expenses on a recurring basis. Then, `merchant country` and the `currency` are important as well specially for those cases really unusual such as expenses in Mauritius or in ZMW currency. We suggest to keep the `category` for a segmentation process explained in the next section. Finally other features such as `purchase type` or `has note` could be included as extra features, and we can let the model decide if they have a real impact or not in the target variable.
+
+
+**Target Variable**
+
+We can use `review_status` as a initial target variable where `OK` or `NOT_REQUIRED` is equivalent to `priority to review = 0` and `WAITING FOR REVIEWER`, `priority to review = 1`. Then, after training the model, we expect to obtain an accurate score value between 0 and 1 that reflects the importance of an expense to be reviewed. This score should help us to determine as well if an expense can be approved automatically when this score is lower certain threshold.
+
+
+**Segmentation Proposal**
+
+Based on the initial data exploration, we suggest 4 different models based on the **category** of the expense for two different reasons. 1) Expense range is different between categories. For example, 80% of expenses of `Meals & Drinks` are between €5 and €30, however expenses of the `Events` category vary from €11 to €340. 2) Variability of the data, even for a fixed range, is entirely different. `Lunch` category seems to follow more uniform distribution over time. Nevertheless, `Events` has a really **high variability** along time. A similar behaviour is followed by `Travel` expenses. We know a ML model can detect this kind of differences, nevertheless, we consider this feature a very important characteristic of a expense where parameters of the model as well as final threshold would be different between categories.
+
+**Proposed Model**
+
+I propose using a **Gradient Boosting Machine (GBM)** model for predicting expense approval. GBM is a powerful ensemble learning technique that builds decision trees sequentially, each one correcting the errors of the previous trees. GBM models are robust, handle complex relationships well, and typically perform well in classification tasks.
+
+**Evaluation Metrics**
+
+To evaluate the performance of the GBM model, we can use the following metrics:
+
+1. **Accuracy:** Overall correctness of the model in predicting the approval status of expenses.
+2. **Precision:** Proportion of correctly predicted approved expenses out of all expenses predicted as approved.
+3. **Recall:** Proportion of correctly predicted approved expenses out of all actual approved expenses.
+4. **F1-Score:** Harmonic mean of precision and recall, providing a balanced measure of model performance.
+5. **Confusion Matrix:** To visualize the true positives, true negatives, false positives, and false negatives.
+
+**Validation Strategy**
+
+We can adopt a cross-validation approach to validate the GBM model. This involves splitting the dataset into multiple subsets, training the model on some subsets, and evaluating its performance on the remaining subset. This process is repeated multiple times, and the average performance metrics are calculated to assess the model's generalization capability.
+
+**Hyperparameter Tuning**
+
+Hyperparameter tuning is crucial for optimizing the performance of the GBM model. Techniques such as grid search or random search can be employed to search through a range of hyperparameters (e.g., learning rate, tree depth, number of estimators) and find the combination that maximizes the model's performance metrics.
+
+**Model Interpretability**
+
+Although GBM models tend to be less interpretable compared to simpler models like logistic regression, techniques such as feature importance analysis can provide insights into which features are most influential in predicting priority to review score. This can help in understanding the underlying factors driving approval decisions. To extract the score we can use the function `gbm_classifier.predict_proba()`
+
+**Implementation**
+
+```{python, eval = F}
+# 1. Feature Selection
+
+# Selecting important features
+selected_features = ['amount_value_EUR', 'days_since_creation', 'team_id', 'merchant_country', 
+                     'amount_currency', 'category', 'purchase_type', 'has_note']
+
+# Encoding categorical features
+label_encoder = LabelEncoder()
+df['team_id'] = label_encoder.fit_transform(df['team_id'])
+df['merchant_country'] = label_encoder.fit_transform(df['merchant_country'])
+df['amount_currency'] = label_encoder.fit_transform(df['amount_currency'])
+df['category'] = label_encoder.fit_transform(df['category'])
+df['purchase_type'] = label_encoder.fit_transform(df['purchase_type'])
+df['has_note'] = df['has_note'].astype(int)  # Assuming 'has_note' is a boolean field
+
+# 2. Target Variable
+
+# Creating the target variable based on `review_status`
+df['priority_to_review'] = df['review_status'].apply(lambda x: 1 if x == 'WAITING_FOR_REVIEWER' else 0)
+
+# 3. Segmentation Proposal (Splitting data by category)
+
+categories = df['category'].unique()
+models = {}
+results = {}
+
+for category in categories:
+    # Filter data by category
+    category_df = df[df['category'] == category]
+    
+    # Split data into features (X) and target (y)
+    X = category_df[selected_features]
+    y = category_df['priority_to_review']
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    
+    # 4. Proposed Model - Gradient Boosting Classifier
+    gbm = GradientBoostingClassifier(random_state=42)
+    
+    # 5. Hyperparameter Tuning - Grid Search
+    param_grid = {
+        'learning_rate': [0.01, 0.1, 0.2],
+        'n_estimators': [100, 200, 300],
+        'max_depth': [3, 5, 7]
+    }
+    
+    grid_search = GridSearchCV(estimator=gbm, param_grid=param_grid, cv=5, scoring='accuracy', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+    
+    # Best model for the category
+    best_gbm = grid_search.best_estimator_
+    
+    # Store the model for future use
+    models[category] = best_gbm
+    
+    # Predictions and evaluations
+    y_pred = best_gbm.predict(X_test)
+    y_proba = best_gbm.predict_proba(X_test)[:, 1]  # Predict probability score
+    
+    # 6. Evaluation Metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    confusion = confusion_matrix(y_test, y_pred)
+    
+    # Store results
+    results[category] = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'confusion_matrix': confusion,
+        'classification_report': classification_report(y_test, y_pred)
+    }
+```
+
+### Conclusions from the Model Results
+
+The results from the Gradient Boosting Machine (GBM) models across the different categories reveal a few important insights:
+
+1. **High Accuracy but Low Recall for Minority Class (1 - Priority to Review)**:
+   - All models demonstrate high overall accuracy (ranging from 88% to 97%). However, this high accuracy primarily stems from the model's strong performance in predicting the majority class (0 - No Priority to Review).
+   - The recall scores for the minority class (1 - Priority to Review) are extremely low across all categories, indicating that the model struggles to correctly identify expenses that need to be reviewed. For example:
+     - Category 3: Recall = 0.05
+     - Category 0: Recall = 0.25
+     - Category 1: Recall = 0.11
+     - Category 2: Recall = 0.05
+   - This means that the models are missing a significant portion of expenses that actually need human attention, which is critical for this problem.
+
+2. **Imbalance in Precision and Recall**:
+   - The precision for the minority class (1) is high in some categories (e.g., Category 3: 1.0, Category 1: 1.0). This suggests that when the model does predict an expense as requiring review, it's often correct. However, this comes at the cost of very low recall, meaning that the model rarely makes these predictions, leading to many false negatives.
+   - Category 0 has more balanced but still low precision and recall for the minority class (precision = 0.5, recall = 0.25). This reflects some improvement in capturing the minority class, but the model still misses a large portion of expenses that need attention.
+
+
+
+## Further Steps
+
+- **Address Class Imbalance** to improve recall and F1-scores for the minority class, consider applying techniques to handle class imbalance, like oversampling the minority class (e.g., SMOTE) or undersampling the majority class or adjusting the class weights in the GBM model to penalize misclassification of the minority class more heavily.
+
+- **Further Feature Engineering**. Consider adding or engineering more features that could help the model distinguish between expenses requiring review and those that don’t. For example, including interactions between features or creating new variables that capture patterns over time might enhance model performance.
+
+- **Model Interpretability**. Use feature importance analysis or SHAP values to better understand which features are driving the predictions. This could provide insights into how to further refine the model or spot any potential issues with the feature set.
+
+By addressing the class imbalance and considering these improvements, the model’s ability to detect expenses that require human review could significantly improve, making the automation process more effective and reliable.

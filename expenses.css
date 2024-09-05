@@ -1,0 +1,50 @@
+body {
+  color: #000000;
+  font-weight: 300;
+}
+
+b, strong {
+  font-weight: 500;
+}
+
+.quarto-title-block .quarto-title-banner {
+  background-size: 100px;
+  background-position-x: 90%;
+  background-position-y: 50%;
+  background-repeat: no-repeat;
+  padding-left: 10px;
+  background-origin: content-box;
+  height: 450px;
+}
+
+.quarto-title h1 {
+  font-size: 4rem;
+  margin-top: 3rem;
+  color: #ffffff;
+}
+
+p.subtitle {
+  font-size: 2rem;
+  color: #ffffff;
+}
+
+details>summary {
+  color: #415a77;
+}
+
+.sidebar nav[role=doc-toc] ul>li>a.active, .sidebar nav[role=doc-toc] ul>li>ul>li>a.active {
+border-left: 1px solid #415a77;
+color: #415a77 !important;
+}
+
+.sidebar nav[role=doc-toc] ul>li>a:hover, .sidebar nav[role=doc-toc] ul>li>ul>li>a:hover {
+color: #415a77 !important;
+}
+
+div.callout-note.callout {
+border-left-color: #415a77;
+}
+
+div.callout-note.callout-style-default>.callout-header {
+background-color: #415a77;
+}
